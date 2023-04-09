@@ -1,0 +1,218 @@
+---
+title: "<center>VaR - wartość narażona na ryzyko</center>"
+output: 
+    html_document:
+          code_folding: hide
+          toc: true
+          toc_float: true
+          number_sections: true
+          css: style.css
+---
+
+<center>
+Karol Doliński
+
+Informatyka i Ekonometria
+</center>
+
+```{r setup, include=FALSE}
+#options(scipen=999)
+knitr::opts_chunk$set(
+ fig.width = 6,
+ fig.asp = 0.9,
+ out.width = "100%"
+)
+```
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(ACDm)
+library(ggplot2)
+library(forecast)
+library(lubridate)
+library(kableExtra)
+library(reshape2)
+library(rugarch)
+library(stringr)
+library(tidyverse)
+library(RColorBrewer)
+library(zoo)
+```
+
+-----
+
+# Wprowadzenie
+
+Celem niniejszej pracy jest oszacowanie wartości narażonej na ryzyko (ang. _Value at Risk_) w oparciu o wyestymowane wartości z modelu AR(1)-GARCH(1,1), a następnie ocena VaR pod względem poprawności wyznaczanych wartości za pomocą testów statystycznych.
+
+Wykorzystane w pracy dane dotyczą okresu od 1 stycznia 2018 roku do 31 grudnia 2019 roku. Zbiór danych dotyczy śróddziennych notowań dla spółki Dino oraz jej dziennych notowań. 
+
+-----
+
+# Model AR(1)-GARCH(1,1)
+
+Pierwszym etapem badania było wyznaczenie zmienności zrealizowanej $\sigma_3^2$ wyrażonej wzorem:
+$$\sigma_3^2 = (1 + \frac{\sigma_{CO}^2}{\sigma_{OC}^2}) \sum_{i=1}^D{r^2_{t,i}},$$
+gdzie:
+
++ $\sigma_{CO}^2$ - wariancja stopy zwrotu pomiędzy kursem z zamknięcia, a kursem z otwarcia następnego dnia, 
++ $\sigma_{OC}^2$ - wariancja zwrotu dziennego (od otwarcia do zamknięcia),
++ $r^2_{t,i}$ - śróddzienna stopa zwrotu z dnia $t$ z okresu $i$, gdzie $i = 1, 2, ..., D$.
++ $D$ - liczba okresów na który można podzielić dzień sesji. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+df_intrady <- as_tibble(read.csv("DNP_intraday_2017_2020.csv", sep = ";"))
+df_daily <- as_tibble(read.csv("dnp_d.csv"))
+
+df_intrady <- df_intrady %>% select(day, hour, price)
+df_intrady["datetime"] <- ymd_hms(paste(df_intrady$day, df_intrady$hour, sep = " "))
+
+df_daily <- df_daily %>% select(day, open, close)
+df_daily$day <- as_date(df_daily$day)
+
+# filtering the required dates
+df_intrady <- df_intrady %>% filter((minute(df_intrady$datetime) %% 10 == 0 & hour(df_intrady$datetime) < 17) | (hour(df_intrady$datetime) == 17 & minute(df_intrady$datetime) == 5))
+df_intrady <- df_intrady %>% filter(year(df_intrady$datetime) %in% c(2018, 2019))
+
+df_daily <- df_daily %>% filter(year(day) %in% c(2018, 2019)) 
+
+# computing rates and filtering overnight rates
+df_intrady["rate"] <- log(df_intrady$price / lag(df_intrady$price))
+df_overnight <- df_intrady %>% filter(hour == "09:00:00") %>% na.omit()
+df_intrady <- df_intrady %>% filter(hour != "09:00:00") 
+
+# computing sigma2
+df_intrady = df_intrady %>% mutate(sigma2 = rate^2)
+
+# computing sigma3
+c <- var(df_overnight$rate) / var(log(df_daily$close / df_daily$open))
+df_sum_sigma2 <- df_intrady %>% group_by(day) %>% summarise(sum_sigma2 = sum(sigma2))
+df_daily["sigma3"] <- (1+c) * df_sum_sigma2$sum_sigma2
+df_daily["sigma3_lag"] <- lag(df_daily$sigma3)
+df_daily["rate"] <- log(df_daily$close / lag(df_daily$close)) 
+df_daily <- na.omit(df_daily)
+```
+
+Następnie wyestymowano parametry modelu AR(1)-GARCH(1,1) z opóźnioną o jeden dzień wartością dziennej zmienności zrealizowanej $\sigma_3^2$ jako dodatkową zmienną objaśniającą w równaniu warunkowej wariancji, wykorzystując pierwsze 120 obserwacji (około 6 miesięcy). Dzięki temu możliwe było wyznaczenie prognozy warunkowej wartości oczekiwanej dziennej stopy zwrotu oraz jej warunkowej wariancji na jeden dzień do przodu. Tak zaprojektowane badanie powtarzano każdorazowo przesuwając o jeden dzień do przodu okno estymacji. W ten sposób wyznaczono prognozy warunkowych wartości oczekiwanych i warunkowych wariancji dla okresu około 18 miesięcy. 
+
+-----
+
+# Model VaR
+
+Na podstawie wyznaczonych prognoz z wykorzystaniem modelu AR(1)-GARCH(1,1) oszacowano wartość narażoną na ryzyko (VaR) w każdym dniu 18 miesięcznego okresu za pomocą funkcji `ugarchroll()` oraz korzystając z uproszczonej wersji, że dzienna stopa zwrotu spółki ma rozkład normalny z parametrami równymi prognozom uzyskanym dla danego dnia za pomocą modelu AR(1)-GARCH(1,1). Przy takim uproszczeniu wartość zagrożoną można wyznaczyć jako:
+
+$$VaR_{t+1|t} = 1-e^{y_{t+1|t}z_\alpha\sqrt{h_{t+1|t}}}, $$ gdzie:
+
++ $y_{t+1|t}$ – prognoza warunkowej wartości oczekiwanej stopy zwrotu, 
++ $h_{t+1|t}$ – prognoza warunkowej wariancji, 
++ $z_\alpha$ – kwantyl odpowiadający prawdopodobieństwu $\alpha$  dla standardowego rozkładu normalnego.
+
+VaR wyestymowany za pomocą funkcji `ugarchroll()` oznaczono jako _VaR I_, a ten wyznaczony w sposób uproszczony jako _VaR II_. Przyjęto poziom istotności równy 5%.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+# Method I
+spec <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                         garchOrder = c(1, 1),
+                                         external.regressors = matrix(df_daily$sigma3_lag)), 
+                   mean.model = list(armaOrder = c(1, 0)),
+                   distribution.model = "norm")
+
+garch_roll <- ugarchroll(spec = spec, 
+                         data = df_daily$rate, 
+                         n.start = 120,
+                         refit.every = 1, 
+                         refit.window = "moving",  
+                         solver = "hybrid", 
+                         calculate.VaR = TRUE, 
+                         VaR.alpha = 0.05, 
+                         keep.coef = TRUE)
+
+VaR_prediction_I <- garch_roll@forecast$VaR$`alpha(5%)`
+
+# Method II
+VaR_prediction_II <- c()
+for(i in 1:(nrow(df_daily)-120)){
+  spec_i <- ugarchspec(variance.model = list(model = "sGARCH", 
+                                             garchOrder = c(1, 1),
+                                             external.regressors = matrix(df_daily$sigma3_lag[i:(119+i)])), 
+                       mean.model = list(armaOrder = c(1, 0)),
+                       distribution.model = "norm")
+  
+  garch_i <- ugarchfit(spec=spec_i, data=matrix(df_daily$rate[i:(119+i)]), solver = "hybrid")
+  forecast_i <- ugarchforecast(fitORspec = garch_i, n.ahead = 1)
+  
+  h_p <- forecast_i@forecast$sigmaFor
+  y_p <- forecast_i@forecast$seriesFor
+  kwantyl <- qnorm(0.05,0,1,lower.tail = F)
+  VaR_prediction_II[i] <- (1 - exp(y_p[1] + kwantyl*h_p[1]))
+}
+```
+
+Wartości zagrożone wyznaczone dwiema metodami są do siebie dosyć zbliżone. Przez większość badanego okresu wartości _VaR I_ są wyższe niż _VaR II_. Warto zauważyć, iż wartość narażona na ryzyko powinna być jak najbliższa stopie zwrotu jednocześnie będąc od niej mniejsza. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, out.width="70%", fig.align="center"}
+df_results <- cbind.data.frame(df_daily$day[121:494], df_daily$rate[121:494], VaR_prediction_I, VaR_prediction_II)
+colnames(df_results) <- c("day", "rate", "VaR I", "VaR II")
+
+melt(df_results, id = "day") %>%
+  ggplot(aes(x = day, y = value)) +
+  geom_line(aes(color = variable)) + 
+  ggtitle("Wartości zagrożone") + 
+  xlab("Dzień") + 
+  ylab("Stopa zwrotu / VaR") + 
+  labs(color="Instrument") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  theme_bw() +
+  scale_color_brewer(palette="Dark2")
+```
+
+# Ocena modelu VaR
+
+Ocena trafności uzyskanych prognoz VaR została dokonana z wykorzystaniem dwóch testów statystycznych: testu Kupca i testu Christoffersena.
+
+## Test Kupca
+
+Test Kupca weryfikuje, czy odsetek przekroczeń jest zgodny z przyjetym poziomem istotności. Hipoteza zerowa jest odrzucana zarówno w przypadku, gdy model niedoszacowuje, jak i wtedy, gdy model przeszacowuje ryzyko.
+
+Zestaw hipotez:
+
+$H_{0}$: VaR jest dobrze wyznaczony
+
+$H_{1}$: VaR nie jest dobrze wyznaczony
+
+
+## Test Christoffersena
+
+Test sprawdza czy przekroczenia wartości narażonej na ryzyko występują w próbie równomiernie (są niezależne w czasie). Jeśli nie, to znaczy, iż model przeszacowuje wartość narażoną na ryzyko w normalnych warunkach, natomiast niedoszacowuje jej w sytuacjach ekstremalnych, niestandardowych. 
+
+Zestaw hipotez:
+
+$H_{0}$: przekroczenia VaR są niezależne w czasie
+
+$H_{1}$: przekroczenia VaR nie są niezależne w czasie
+
+## Wyniki testów
+
+Wyniki testów dla obu metod _VaR I_ i _VaR II_ są identyczne. Brak jest podstaw do odrzucenia hipotez głównych ponieważ p-value jest większe od 5%. Można stwierdzić, iż VaR jest dobrze wyznaczony oraz przekroczenia VaR są niezależne w czasie.
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, out.width="70%", fig.align="center"}
+df_test_results <- as.data.frame(matrix(NA, 2, 2))
+colnames(df_test_results) <- c("VaR I", "VaR II")
+rownames(df_test_results) <- c("Test Kupca", "Test Christoffersena")
+
+df_test_results[1,1] <- VaRTest(alpha = 0.05, VaR = VaR_prediction_I, actual = df_results$rate)$uc.LRp
+df_test_results[2,1] <- VaRTest(alpha = 0.05, VaR = VaR_prediction_I, actual = df_results$rate)$cc.LRp
+df_test_results[1,2] <- VaRTest(alpha = 0.05, VaR = VaR_prediction_II, actual = df_results$rate)$uc.LRp
+df_test_results[2,2] <- VaRTest(alpha = 0.05, VaR = VaR_prediction_II, actual = df_results$rate)$cc.LRp
+
+df_test_results %>% kbl() %>% kable_styling() %>%
+  footnote(general = "Tab. 1.: P-value dla testu Kupca i Christoffersena",
+           general_title = "", footnote_as_chunk = T, title_format = c("italic"))
+```
+-----
+
+# Podsumowanie
+
+W pracy skutecznie wyznaczono VaR za pomocą dwóch metod wykorzystując model AR(1)-GARCH(1,1). Ponadto wyznaczono wartości zmienności zrealizowanej i uwzględniono je podczas estymacji modelu w równaniu warunkowej wariancji. Ocena obu podejść VaR za pomocą testów statystycznych wyszła identyczna, tzn. VaR został dobrze wyznaczony oraz jego przekroczenia były niezależne w czasie. Warto podkreślić, iż wartość narażona na ryzyko powinna być jak najbliższa stopie zwrotu jednocześnie będąc od niej mniejsza. Z uwagi na to, można by wskazać VaR I jako lepszy, ponieważ jest on częściej bliższy wartościom stopy zwrotu. Jednocześnie należy zaznaczyć, iż VaR nie jest odpowiednim narzędziem określania ryzyka, gdy występują zdarzenia ekstremalne. 
+
+-----
+
